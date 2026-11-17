@@ -16,6 +16,7 @@ local DataStoreService = game:GetService("DataStoreService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ServerStorage = game:GetService("ServerStorage")
 local CollectionService = game:GetService("CollectionService")
+local Debris = game:GetService("Debris")
 
 local JobsConfig = require(ReplicatedStorage:WaitForChild("JobsConfig"))
 
@@ -197,40 +198,190 @@ end
 ---------------------------------------------------------------------
 -- Tools & abilities
 ---------------------------------------------------------------------
+---------------------------------------------------------------------
+-- Medic tools: Medkit (drops a medkit pickup), Use Medkit, First Aid
+---------------------------------------------------------------------
+local MEDKIT_COOLDOWN = 20 -- seconds between the medic dropping medkits
+local MEDKIT_LIFETIME = 120 -- seconds before an unclaimed medkit disappears (0 = never)
+local MEDKIT_SPAWN_DISTANCE = 4 -- studs in front of the medic
+local USE_MEDKIT_HEAL = 50 -- health restored by the "Use Medkit" tool
+local FIRST_AID_HEAL = 20 -- health restored by "First Aid"
+local FIRST_AID_RANGE = 10 -- studs
+local FIRST_AID_COOLDOWN = 3 -- seconds
+
+local createTool -- defined further down (the medkit pickup hands out a tool)
+
+local medkitLastUse = setmetatable({}, { __mode = "k" }) -- [player] = os.clock()
+local firstAidLastUse = setmetatable({}, { __mode = "k" })
+
+-- The First Aid tool's click target comes from the client (see MedicClient)
+local firstAidEvent = Instance.new("RemoteEvent")
+firstAidEvent.Name = "FirstAid"
+firstAidEvent.Parent = remotes
+
+-- Heals a humanoid, never above its max. Returns how much was actually healed.
+local function healHumanoid(humanoid, amount)
+	if humanoid.Health <= 0 then
+		return 0
+	end
+	local before = humanoid.Health
+	humanoid.Health = math.min(humanoid.MaxHealth, before + amount)
+	return humanoid.Health - before
+end
+
+-- Clones the Part named "medkit" from ReplicatedStorage and drops it into the world.
+-- (If there isn't one, a plain white box is used so everything still works.)
+local function spawnMedkitPart(cframe)
+	local template = ReplicatedStorage:FindFirstChild("medkit")
+	local part
+	if template and template:IsA("BasePart") then
+		part = template:Clone()
+	else
+		warn("[JobService] ReplicatedStorage needs a Part named 'medkit'. Using a placeholder box for now.")
+		part = Instance.new("Part")
+		part.Name = "medkit"
+		part.Size = Vector3.new(2, 1, 1.5)
+		part.Color = Color3.fromRGB(240, 240, 240)
+		part.Material = Enum.Material.SmoothPlastic
+	end
+
+	part.Anchored = false -- so it follows physics and drops to the ground
+	part.CanCollide = true
+	part.CanTouch = true
+	part.CFrame = cframe
+	part.Parent = workspace
+	pcall(function()
+		part:SetNetworkOwner(nil) -- keep the physics on the server
+	end)
+	return part
+end
+
+local function giveUseMedkit(player)
+	local backpack = player:FindFirstChildOfClass("Backpack")
+	if backpack then
+		createTool("Use Medkit", false).Parent = backpack
+	end
+end
+
+-- "Medkit" (the medic's tool): drops a medkit in front of the medic, 20 second cooldown
 local function setupMedkit(tool)
-	local onCooldown = false
 	tool.Activated:Connect(function()
-		if onCooldown then
-			return
-		end
 		local character = tool.Parent
+		local player = character and Players:GetPlayerFromCharacter(character)
 		local root = character and character:FindFirstChild("HumanoidRootPart")
-		if not root then
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		if not player or not root or not humanoid or humanoid.Health <= 0 then
 			return
 		end
 
-		local target, bestDist = nil, 12
-		for _, other in ipairs(Players:GetPlayers()) do
-			local c = other.Character
-			local hum = c and c:FindFirstChildOfClass("Humanoid")
-			local otherRoot = c and c:FindFirstChild("HumanoidRootPart")
-			if hum and otherRoot and hum.Health > 0 and hum.Health < hum.MaxHealth then
-				local dist = (otherRoot.Position - root.Position).Magnitude
-				if dist < bestDist then
-					target, bestDist = hum, dist
-				end
-			end
+		local now = os.clock()
+		local remaining = MEDKIT_COOLDOWN - (now - (medkitLastUse[player] or -math.huge))
+		if remaining > 0 then
+			notifyEvent:FireClient(player, ("Medkit ready in %d seconds."):format(math.ceil(remaining)))
+			return
 		end
+		medkitLastUse[player] = now
 
-		if target then
-			onCooldown = true
-			target.Health = math.min(target.MaxHealth, target.Health + 40)
-			task.delay(5, function()
-				onCooldown = false
-			end)
+		local part = spawnMedkitPart(CFrame.new(root.Position + root.CFrame.LookVector * MEDKIT_SPAWN_DISTANCE))
+
+		-- Whoever touches it first picks it up
+		local claimed = false
+		local connection
+		connection = part.Touched:Connect(function(hit)
+			if claimed then
+				return
+			end
+			local hitCharacter = hit:FindFirstAncestorOfClass("Model")
+			local toucher = hitCharacter and Players:GetPlayerFromCharacter(hitCharacter)
+			local touchHumanoid = hitCharacter and hitCharacter:FindFirstChildOfClass("Humanoid")
+			if not toucher or not touchHumanoid or touchHumanoid.Health <= 0 then
+				return
+			end
+			if not toucher:FindFirstChildOfClass("Backpack") then
+				return
+			end
+
+			claimed = true
+			connection:Disconnect()
+			part:Destroy()
+			giveUseMedkit(toucher)
+			notifyEvent:FireClient(toucher, ("You picked up a medkit! Use it to heal %d health."):format(USE_MEDKIT_HEAL))
+		end)
+
+		if MEDKIT_LIFETIME > 0 then
+			Debris:AddItem(part, MEDKIT_LIFETIME)
 		end
 	end)
 end
+
+-- "Use Medkit" (given when you pick up a medkit): heals the user 50 health, then is used up
+local function setupUseMedkit(tool)
+	local used = false
+	tool.Activated:Connect(function()
+		if used then
+			return
+		end
+		local character = tool.Parent
+		local player = character and Players:GetPlayerFromCharacter(character)
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		if not player or not humanoid or humanoid.Health <= 0 then
+			return
+		end
+		if humanoid.Health >= humanoid.MaxHealth then
+			notifyEvent:FireClient(player, "You are already at full health.")
+			return
+		end
+
+		used = true
+		local healed = healHumanoid(humanoid, USE_MEDKIT_HEAL)
+		notifyEvent:FireClient(player, ("You used a medkit and healed %d health."):format(math.floor(healed + 0.5)))
+		tool:Destroy()
+	end)
+end
+
+-- "First Aid": equip it and click a player within range to heal them. The server re-checks everything.
+firstAidEvent.OnServerEvent:Connect(function(player, target)
+	if typeof(target) ~= "Instance" or not target:IsA("Player") or target == player then
+		return
+	end
+
+	local character = player.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	local tool = character and character:FindFirstChild("First Aid")
+	if not root or not humanoid or humanoid.Health <= 0 then
+		return
+	end
+	-- Must be holding the First Aid tool the job gave them
+	if not tool or not tool:IsA("Tool") or not tool:GetAttribute("JobTool") then
+		return
+	end
+
+	local now = os.clock()
+	if now - (firstAidLastUse[player] or -math.huge) < FIRST_AID_COOLDOWN then
+		return
+	end
+
+	local targetCharacter = target.Character
+	local targetRoot = targetCharacter and targetCharacter:FindFirstChild("HumanoidRootPart")
+	local targetHumanoid = targetCharacter and targetCharacter:FindFirstChildOfClass("Humanoid")
+	if not targetRoot or not targetHumanoid or targetHumanoid.Health <= 0 then
+		return
+	end
+
+	if (targetRoot.Position - root.Position).Magnitude > FIRST_AID_RANGE then
+		notifyEvent:FireClient(player, ("%s is too far away."):format(target.Name))
+		return
+	end
+	if targetHumanoid.Health >= targetHumanoid.MaxHealth then
+		notifyEvent:FireClient(player, ("%s is already at full health."):format(target.Name))
+		return
+	end
+
+	firstAidLastUse[player] = now -- cooldown only starts after a successful heal
+	local healed = healHumanoid(targetHumanoid, FIRST_AID_HEAL)
+	notifyEvent:FireClient(player, ("Healed %s for %d health."):format(target.Name, math.floor(healed + 0.5)))
+end)
 
 -- Lockpick: finds the nearest purchasable door and tells it a lockpick attempt happened.
 -- The door script decides whether the attempt succeeds.
@@ -301,7 +452,21 @@ local function setupMegaphone(tool)
 	end)
 end
 
-local function createTool(toolName)
+-- Chemistry Set: tells ChemService the Chemist used it. ChemService opens the chem menu.
+local chemistrySetUsed = Instance.new("BindableEvent")
+chemistrySetUsed.Name = "ChemistrySetUsed"
+chemistrySetUsed.Parent = ServerStorage
+
+local function setupChemistrySet(tool)
+	tool.Activated:Connect(function()
+		local player = Players:GetPlayerFromCharacter(tool.Parent)
+		if player then
+			chemistrySetUsed:Fire(player)
+		end
+	end)
+end
+
+function createTool(toolName, isJobTool)
 	local jobTools = ServerStorage:FindFirstChild("JobTools")
 	local template = jobTools and jobTools:FindFirstChild(toolName)
 
@@ -322,13 +487,19 @@ local function createTool(toolName)
 		handle.Parent = tool
 	end
 
-	tool:SetAttribute("JobTool", true)
+	if isJobTool ~= false then
+		tool:SetAttribute("JobTool", true) -- job tools are removed when the player changes job
+	end
 	if toolName == "Medkit" then
 		setupMedkit(tool)
 	elseif toolName == "Lockpick" then
 		setupLockpick(tool)
 	elseif toolName == "Megaphone" then
 		setupMegaphone(tool)
+	elseif toolName == "Use Medkit" then
+		setupUseMedkit(tool)
+	elseif toolName == "Chemistry Set" then
+		setupChemistrySet(tool)
 	end
 	return tool
 end
@@ -347,7 +518,9 @@ local function clearJobTools(player)
 	clear(player.Character)
 end
 
-local function applyJob(player, isSpawn)
+-- Applies the job's stats (speed, jump, max health) plus any active chem buffs.
+-- isSpawn: restore the saved health. Otherwise (job change or buff change) health follows the max-health rules.
+local function applyStats(player, isSpawn)
 	local session = sessions[player]
 	local character = player.Character
 	if not session or not character then
@@ -362,14 +535,18 @@ local function applyJob(player, isSpawn)
 	local abilities = job.Abilities or {}
 
 	-- Stats (fall back to Roblox defaults)
-	humanoid.WalkSpeed = abilities.WalkSpeed or 16
+	-- Chem buffs are additive: base * (1 + total bonus)
+	local speedMultiplier = 1 + (player:GetAttribute("BuffSpeed") or 0)
+	local jumpHeightMultiplier = 1 + (player:GetAttribute("BuffJump") or 0)
+	humanoid.WalkSpeed = (abilities.WalkSpeed or 16) * speedMultiplier
 	humanoid.UseJumpPower = true
-	humanoid.JumpPower = abilities.JumpPower or 50
+	-- Jump height grows with the SQUARE of jump power, so +200% height = power x sqrt(3)
+	humanoid.JumpPower = (abilities.JumpPower or 50) * math.sqrt(jumpHeightMultiplier)
 	-- Health. On spawn we restore the saved health (or full health on first join / after dying).
 	-- On a job change: if max health went UP, current health goes up by the same amount.
 	-- It never goes down, unless it is above the new max (then it becomes the new max).
 	local data = session.Data
-	local newMax = abilities.MaxHealth or 100
+	local newMax = math.round((abilities.MaxHealth or 100) * (1 + (player:GetAttribute("BuffMaxHealth") or 0)))
 	if isSpawn then
 		if session.RespawnFull or data.Health == nil then
 			data.Health = newMax
@@ -387,14 +564,31 @@ local function applyJob(player, isSpawn)
 	else
 		humanoid.MaxHealth = newMax -- dead: the respawn will set their health
 	end
+end
+
+local function applyJob(player, isSpawn)
+	local session = sessions[player]
+	if not session or not player.Character then
+		return
+	end
+	applyStats(player, isSpawn)
 
 	-- Tools
+	local abilities = JobsConfig.ById[session.Data.Job].Abilities or {}
 	clearJobTools(player)
 	local backpack = player:WaitForChild("Backpack")
 	for _, toolName in ipairs(abilities.Tools or {}) do
 		createTool(toolName).Parent = backpack
 	end
 end
+
+-- ChemService fires this when a player's chem buffs change, so speed / jump / max health update
+local buffsChanged = Instance.new("BindableEvent")
+buffsChanged.Name = "BuffsChanged"
+buffsChanged.Parent = ServerStorage
+buffsChanged.Event:Connect(function(player)
+	applyStats(player, false)
+end)
 
 -- Hunger tick: hunger drops, and once it is empty health drops instead
 local function applyHungerTick(player, data)
@@ -403,7 +597,9 @@ local function applyHungerTick(player, data)
 	else
 		local humanoid = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
 		if humanoid and humanoid.Health > 0 then
-			humanoid.Health = math.max(0, humanoid.Health - JobsConfig.STARVATION_DAMAGE)
+			-- Damage reduction (like the Invincibility Chem) also applies to starvation
+			local multiplier = math.max(0, 1 - (player:GetAttribute("BuffDamageReduction") or 0))
+			humanoid.Health = math.max(0, humanoid.Health - JobsConfig.STARVATION_DAMAGE * multiplier)
 		end
 	end
 end

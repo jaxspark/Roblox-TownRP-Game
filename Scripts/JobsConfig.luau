@@ -56,9 +56,9 @@ JobsConfig.Jobs = {
 		Id = "Medic",
 		Name = "Medic",
 		Salary = 250,
-		Description = "Heals nearby players with the Medkit.",
+		Description = "Drops medkits and heals players with First Aid.",
 		Selectable = true,
-		Abilities = { Tools = { "Medkit" }, MaxHealth = 140, WalkSpeed = 18 },
+		Abilities = { Tools = { "Medkit", "First Aid" }, MaxHealth = 140, WalkSpeed = 18 },
 	},
 	{
 		Id = "Cook",
