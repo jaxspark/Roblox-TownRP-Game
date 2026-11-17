@@ -79,8 +79,8 @@ JobsConfig.Jobs = {
 		Abilities = { Tools = { "Megaphone" }, MaxHealth = 120, WalkSpeed = 14 },
 	},
 	{
-		Id = "Sherriff",
-		Name = "Sherriff",
+		Id = "Sheriff",
+		Name = "Sheriff",
 		Salary = 250,
 		Description = "Runs the police. Allows you to create arrest warrants.",
 		Selectable = true,
