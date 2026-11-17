@@ -180,8 +180,9 @@ local jobHudLabel = label({
 })
 
 local toast = label({
-	Size = UDim2.new(0, 360, 0, 36),
-	Position = UDim2.new(0.5, -180, 0, -50),
+	Size = UDim2.new(0, 360, 0, 60),
+	TextWrapped = true,
+	Position = UDim2.new(0.5, -180, 0, -80),
 	TextXAlignment = Enum.TextXAlignment.Center,
 	BackgroundTransparency = 0.1,
 	BackgroundColor3 = Color3.fromRGB(28, 28, 33),
@@ -197,7 +198,7 @@ notifyEvent.OnClientEvent:Connect(function(message)
 	toast:TweenPosition(UDim2.new(0.5, -180, 0, 12), "Out", "Quad", 0.25, true)
 	task.delay(4, function()
 		if token == toastToken then
-			toast:TweenPosition(UDim2.new(0.5, -180, 0, -50), "In", "Quad", 0.25, true)
+			toast:TweenPosition(UDim2.new(0.5, -180, 0, -80), "In", "Quad", 0.25, true)
 		end
 	end)
 end)

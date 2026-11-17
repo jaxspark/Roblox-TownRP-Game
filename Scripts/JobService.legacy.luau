@@ -272,6 +272,20 @@ local function setupLockpick(tool)
 	end)
 end
 
+-- Megaphone: tells LawService the Mayor used it. LawService opens the "Declare a Law" prompt.
+local megaphoneUsed = Instance.new("BindableEvent")
+megaphoneUsed.Name = "MegaphoneUsed"
+megaphoneUsed.Parent = ServerStorage
+
+local function setupMegaphone(tool)
+	tool.Activated:Connect(function()
+		local player = Players:GetPlayerFromCharacter(tool.Parent)
+		if player then
+			megaphoneUsed:Fire(player)
+		end
+	end)
+end
+
 local function createTool(toolName)
 	local jobTools = ServerStorage:FindFirstChild("JobTools")
 	local template = jobTools and jobTools:FindFirstChild(toolName)
@@ -298,6 +312,8 @@ local function createTool(toolName)
 		setupMedkit(tool)
 	elseif toolName == "Lockpick" then
 		setupLockpick(tool)
+	elseif toolName == "Megaphone" then
+		setupMegaphone(tool)
 	end
 	return tool
 end
