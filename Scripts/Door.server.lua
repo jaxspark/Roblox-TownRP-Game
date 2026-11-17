@@ -2,16 +2,20 @@
 	Door  (Script)
 	Location: put this Script INSIDE the door Part.
 
-	- Any player with enough money can buy the door (ProximityPrompt) and then walk through it.
-	  Purchases are saved, so owners keep access when they rejoin.
+	- Players with enough money can buy the door (ProximityPrompt) and then walk through it.
+	  A door can only have a limited number of owners at once (default 1).
+	- When a door is full, its prompt shows who owns it instead ("Owned by Bob").
+	- Owners lose access (and get a 50% refund) when they leave the server.
 	- A player whose job is "Criminal" can use the Lockpick tool near the door:
 	  10% chance to be able to walk through for 3 seconds.
 
 	Optional attributes you can set on the door Part (Properties > Attributes):
-	  DoorId (string)  - unique id for this door, letters/numbers/underscores only.
-	                     Defaults to the Part's name, so give each door a UNIQUE name or DoorId.
-	  Price  (number)  - price of the door. Defaults to DEFAULT_PRICE below.
-	  
+	  DoorId (string)           - unique id for this door, letters/numbers/underscores only.
+	                              Defaults to the Part's name, so give each door a UNIQUE name or DoorId.
+	  Price  (number)           - price of the door. Defaults to DEFAULT_PRICE below.
+	  NumAllowedOwners (number) - how many players can own the door at once in a server.
+	                              Defaults to DEFAULT_ALLOWED_OWNERS below (1).
+
 	Requires JobService, DoorClient and the Notify remote from the base template.
 ]]
 
@@ -24,6 +28,7 @@ local ServerStorage = game:GetService("ServerStorage")
 -- Settings
 ---------------------------------------------------------------------
 local DEFAULT_PRICE = 500
+local DEFAULT_ALLOWED_OWNERS = 1
 local LOCKPICK_SUCCESS_CHANCE = 0.10 -- 10%
 local LOCKPICK_PASS_DURATION = 3 -- seconds the door is passable after a success
 local CRIMINAL_JOB_ID = "Criminal" -- must match the Id in JobsConfig
@@ -39,11 +44,17 @@ end
 -- Attribute names can only contain letters, numbers and underscores
 local doorId = tostring(door:GetAttribute("DoorId") or door.Name):gsub("[^%w_]", "_")
 local price = door:GetAttribute("Price") or DEFAULT_PRICE
+local maxOwners = door:GetAttribute("NumAllowedOwners") or DEFAULT_ALLOWED_OWNERS
+if type(maxOwners) ~= "number" then
+	maxOwners = DEFAULT_ALLOWED_OWNERS
+end
+maxOwners = math.max(1, math.floor(maxOwners))
 local ownedAttribute = "Door_" .. doorId
 local passAttribute = "DoorPass_" .. doorId
 
 door:SetAttribute("DoorId", doorId)
 door:SetAttribute("Price", price)
+door:SetAttribute("NumAllowedOwners", maxOwners)
 door.CanCollide = true -- stays solid on the server; owners get a client-side pass
 CollectionService:AddTag(door, "PurchasableDoor")
 
@@ -59,13 +70,68 @@ if not prompt then
 	prompt.RequiresLineOfSight = false
 	prompt.Parent = door
 end
-prompt.ActionText = "Buy Door"
-prompt.ObjectText = "$" .. price
+local buyHoldDuration = prompt.HoldDuration
 
 -- Lets JobService's Lockpick tool talk to this door
 local lockpickAttempt = Instance.new("BindableEvent")
 lockpickAttempt.Name = "LockpickAttempt"
 lockpickAttempt.Parent = door
+
+---------------------------------------------------------------------
+-- Owners + prompt text
+---------------------------------------------------------------------
+-- Names of the players who currently own this door (ownership is a player attribute set by JobService)
+local function getOwners()
+	local names = {}
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p:GetAttribute(ownedAttribute) then
+			table.insert(names, p.Name)
+		end
+	end
+	table.sort(names)
+	return names
+end
+
+-- "Bob" / "Bob and Sue" / "Bob, Sue, and Tim"
+local function joinNames(names)
+	local n = #names
+	if n == 1 then
+		return names[1]
+	elseif n == 2 then
+		return names[1] .. " and " .. names[2]
+	end
+	return table.concat(names, ", ", 1, n - 1) .. ", and " .. names[n]
+end
+
+local function refreshPrompt()
+	local owners = getOwners()
+	if #owners >= maxOwners then
+		-- Door is full: show who owns it instead of the purchase prompt
+		prompt.ActionText = "Owned by " .. joinNames(owners)
+		prompt.ObjectText = ""
+		prompt.HoldDuration = 0
+	else
+		prompt.ActionText = "Buy Door"
+		prompt.HoldDuration = buyHoldDuration
+		if #owners > 0 then
+			prompt.ObjectText = "$" .. price .. ", owned by " .. joinNames(owners)
+		else
+			prompt.ObjectText = "$" .. price
+		end
+	end
+end
+
+local function watchPlayer(p)
+	p:GetAttributeChangedSignal(ownedAttribute):Connect(refreshPrompt)
+end
+for _, p in ipairs(Players:GetPlayers()) do
+	watchPlayer(p)
+end
+Players.PlayerAdded:Connect(watchPlayer)
+Players.PlayerRemoving:Connect(function()
+	task.defer(refreshPrompt)
+end)
+refreshPrompt()
 
 ---------------------------------------------------------------------
 -- Buying
@@ -75,7 +141,15 @@ prompt.Triggered:Connect(function(player)
 		notify:FireClient(player, "You already own this door.")
 		return
 	end
-	local _, message = purchaseDoor:Invoke(player, doorId, price)
+
+	local owners = getOwners()
+	if #owners >= maxOwners then
+		notify:FireClient(player, "Owned by " .. joinNames(owners))
+		return
+	end
+
+	-- JobService does the final check and takes the money
+	local _, message = purchaseDoor:Invoke(player, doorId, price, maxOwners)
 	notify:FireClient(player, message)
 end)
 
