@@ -53,6 +53,9 @@ local function defaultData()
 		LastJobChange = 0, -- unix time of last change (0 = never, so first pick is free)
 		SalaryProgress = 0, -- seconds toward the next paycheck
 		DoorPurchases = {}, -- [doorId] = price paid. Refunded 50% when the player leaves
+		Hunger = JobsConfig.MAX_HUNGER,
+		HungerProgress = 0, -- seconds toward the next hunger tick
+		-- Health is added the first time the player spawns (it starts at their job's max health)
 	}
 end
 
@@ -111,6 +114,16 @@ local function loadData(player)
 			if type(data.DoorPurchases) ~= "table" then
 				data.DoorPurchases = {}
 			end
+			if type(data.Hunger) ~= "number" then
+				data.Hunger = JobsConfig.MAX_HUNGER
+			end
+			data.Hunger = math.clamp(data.Hunger, 0, JobsConfig.MAX_HUNGER)
+			if type(data.HungerProgress) ~= "number" then
+				data.HungerProgress = 0
+			end
+			if type(data.Health) ~= "number" or data.Health <= 0 then
+				data.Health = nil -- full health on next spawn
+			end
 			return data
 		end
 		warn(("Load failed for %s (attempt %d): %s"):format(player.Name, attempt, tostring(result)))
@@ -162,6 +175,8 @@ local function syncPlayer(player)
 	player:SetAttribute("JobId", job.Id)
 	player:SetAttribute("NextJobChange", data.LastJobChange + JobsConfig.JOB_CHANGE_COOLDOWN)
 	player:SetAttribute("SalaryProgress", data.SalaryProgress)
+	player:SetAttribute("Hunger", data.Hunger)
+	player:SetAttribute("MaxHunger", JobsConfig.MAX_HUNGER)
 end
 
 local function createLeaderstats(player)
@@ -332,7 +347,7 @@ local function clearJobTools(player)
 	clear(player.Character)
 end
 
-local function applyJob(player)
+local function applyJob(player, isSpawn)
 	local session = sessions[player]
 	local character = player.Character
 	if not session or not character then
@@ -350,9 +365,28 @@ local function applyJob(player)
 	humanoid.WalkSpeed = abilities.WalkSpeed or 16
 	humanoid.UseJumpPower = true
 	humanoid.JumpPower = abilities.JumpPower or 50
-	local maxHealth = abilities.MaxHealth or 100
-	humanoid.MaxHealth = maxHealth
-	humanoid.Health = maxHealth
+	-- Health. On spawn we restore the saved health (or full health on first join / after dying).
+	-- On a job change: if max health went UP, current health goes up by the same amount.
+	-- It never goes down, unless it is above the new max (then it becomes the new max).
+	local data = session.Data
+	local newMax = abilities.MaxHealth or 100
+	if isSpawn then
+		if session.RespawnFull or data.Health == nil then
+			data.Health = newMax
+			session.RespawnFull = false
+		end
+		humanoid.MaxHealth = newMax
+		humanoid.Health = math.min(data.Health, newMax)
+	elseif humanoid.Health > 0 then
+		local health = humanoid.Health
+		if newMax > humanoid.MaxHealth then
+			health += newMax - humanoid.MaxHealth
+		end
+		humanoid.MaxHealth = newMax
+		humanoid.Health = math.min(health, newMax)
+	else
+		humanoid.MaxHealth = newMax -- dead: the respawn will set their health
+	end
 
 	-- Tools
 	clearJobTools(player)
@@ -360,6 +394,78 @@ local function applyJob(player)
 	for _, toolName in ipairs(abilities.Tools or {}) do
 		createTool(toolName).Parent = backpack
 	end
+end
+
+-- Hunger tick: hunger drops, and once it is empty health drops instead
+local function applyHungerTick(player, data)
+	if data.Hunger > 0 then
+		data.Hunger = math.max(0, data.Hunger - JobsConfig.HUNGER_DROP)
+	else
+		local humanoid = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+		if humanoid and humanoid.Health > 0 then
+			humanoid.Health = math.max(0, humanoid.Health - JobsConfig.STARVATION_DAMAGE)
+		end
+	end
+end
+
+-- Roblox's built-in script slowly heals players. Remove it so health only changes through our systems.
+local function disableDefaultRegen(character)
+	local existing = character:FindFirstChild("Health")
+	if existing and existing:IsA("BaseScript") then
+		existing:Destroy()
+		return
+	end
+	task.spawn(function()
+		local late = character:WaitForChild("Health", 3)
+		if late and late:IsA("BaseScript") then
+			late:Destroy()
+		end
+	end)
+end
+
+-- Runs every time the player's character spawns
+local function setupCharacter(player, character)
+	local session = sessions[player]
+	if not session or not session.Loaded then
+		return
+	end
+	local humanoid = character:WaitForChild("Humanoid", 5)
+	if not humanoid then
+		return
+	end
+
+	disableDefaultRegen(character)
+	applyJob(player, true)
+	session.Data.Health = humanoid.Health
+
+	-- Keep the saved health in step with the Humanoid (damage, healing, starvation...)
+	humanoid.HealthChanged:Connect(function(health)
+		if health > 0 and sessions[player] == session then
+			session.Data.Health = health
+		end
+	end)
+
+	-- Dying: lose most of your money, then respawn with full health and hunger
+	humanoid.Died:Connect(function()
+		if sessions[player] ~= session then
+			return
+		end
+		local data = session.Data
+		local lost = data.Money * JobsConfig.DEATH_MONEY_LOSS_PERCENT // 100 -- rounded down
+		data.Money -= lost
+		data.Hunger = JobsConfig.MAX_HUNGER
+
+		local job = JobsConfig.ById[data.Job]
+		data.Health = (job.Abilities and job.Abilities.MaxHealth) or 100
+		session.RespawnFull = true -- also re-checked on spawn, in case they change job while dead
+
+		syncPlayer(player)
+		if lost > 0 then
+			notifyEvent:FireClient(player, ("You died and lost $%d."):format(lost))
+		else
+			notifyEvent:FireClient(player, "You died.")
+		end
+	end)
 end
 
 ---------------------------------------------------------------------
@@ -481,6 +587,12 @@ task.spawn(function()
 						notifyEvent:FireClient(player, ("Paycheck received: $%d"):format(job.Salary))
 					end
 				end
+				-- Hunger: every HUNGER_INTERVAL seconds of in-game time (only runs while the player is online)
+				data.HungerProgress += dt
+				if data.HungerProgress >= JobsConfig.HUNGER_INTERVAL then
+					data.HungerProgress -= JobsConfig.HUNGER_INTERVAL
+					applyHungerTick(player, data)
+				end
 				syncPlayer(player)
 			end
 		end
@@ -525,11 +637,11 @@ local function onPlayerAdded(player)
 	syncPlayer(player)
 	setDoorAttributes(player)
 
-	player.CharacterAdded:Connect(function()
-		applyJob(player)
+	player.CharacterAdded:Connect(function(character)
+		setupCharacter(player, character)
 	end)
 	if player.Character then
-		applyJob(player)
+		task.spawn(setupCharacter, player, player.Character)
 	end
 
 	task.delay(3, function() -- give the client a moment to build its UI
@@ -551,6 +663,10 @@ local function onPlayerRemoving(player)
 		session.Leaving = true -- frees up their job slot immediately
 		refundDoors(session.Data) -- doors become unowned, player gets 50% back
 		clearDoorAttributes(player) -- door prompts update right away
+		local humanoid = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+		if humanoid and humanoid.Health > 0 then
+			session.Data.Health = humanoid.Health -- saved so it is the same when they come back
+		end
 	end
 	saveData(player)
 	sessions[player] = nil

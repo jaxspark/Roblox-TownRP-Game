@@ -28,6 +28,13 @@ JobsConfig.JOB_CHANGE_COOLDOWN = 30 * 1
 -- Job a brand-new player starts with (salary 0). Their first pick is free of cooldown.
 JobsConfig.DEFAULT_JOB = "Unemployed"
 
+-- Hunger and health
+JobsConfig.MAX_HUNGER = 100 -- same for every player
+JobsConfig.HUNGER_INTERVAL = 30 -- seconds of in-game time between hunger ticks
+JobsConfig.HUNGER_DROP = 2 -- hunger lost each tick
+JobsConfig.STARVATION_DAMAGE = 2 -- health lost each tick once hunger is 0
+JobsConfig.DEATH_MONEY_LOSS_PERCENT = 66 -- % of a player's money lost when they die (rounded down)
+
 JobsConfig.Jobs = {
 	{
 		Id = "Unemployed",
@@ -79,8 +86,8 @@ JobsConfig.Jobs = {
 		Abilities = { Tools = { "Megaphone" }, MaxHealth = 120, WalkSpeed = 14 },
 	},
 	{
-		Id = "Sheriff",
-		Name = "Sheriff",
+		Id = "Sherriff",
+		Name = "Sherriff",
 		Salary = 250,
 		Description = "Runs the police. Allows you to create arrest warrants.",
 		Selectable = true,

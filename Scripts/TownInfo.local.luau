@@ -360,6 +360,22 @@ local function setOpen(open)
 	end
 end
 
+-- On-screen button (same style as the Jobs button, placed just below it)
+local toggleButton = Instance.new("TextButton")
+toggleButton.Size = UDim2.new(0, 110, 0, 36)
+toggleButton.Position = UDim2.new(0, 12, 0.5, 26)
+toggleButton.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
+toggleButton.Font = Enum.Font.GothamBold
+toggleButton.Text = "Town Info (I)"
+toggleButton.TextColor3 = Color3.new(1, 1, 1)
+toggleButton.TextSize = 13
+toggleButton.Parent = gui
+corner(toggleButton)
+
+toggleButton.Activated:Connect(function()
+	setOpen(not frame.Visible)
+end)
+
 ---------------------------------------------------------------------
 -- "Declare a Law" prompt (opens when the Mayor uses the Megaphone)
 ---------------------------------------------------------------------
