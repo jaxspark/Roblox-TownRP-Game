@@ -12,6 +12,9 @@
 		Tools      - list of tool names. The server looks for a Tool with that
 		             name in ServerStorage > JobTools. If none exists, a simple
 		             placeholder tool is created so the template works out of the box.
+
+	Other job options:
+		MaxPerServer - optional number. Limits how many players can hold this job at once per server.
 ]]
 
 local JobsConfig = {}
@@ -72,6 +75,7 @@ JobsConfig.Jobs = {
 		Salary = 300,
 		Description = "Runs the city. Allows you to set laws.",
 		Selectable = true,
+		MaxPerServer = 1, -- only one mayor per server
 		Abilities = { Tools = { "Megaphone" }, MaxHealth = 120, WalkSpeed = 14 },
 	},
 	{
@@ -80,6 +84,7 @@ JobsConfig.Jobs = {
 		Salary = 250,
 		Description = "Runs the police. Allows you to create arrest warrants.",
 		Selectable = true,
+		MaxPerServer = 1, -- only one sheriff per server
 		Abilities = { Tools = { "Baton", "Handcuffs", "Arrest Warrant" }, MaxHealth = 150, WalkSpeed = 17 },
 	},
 	{

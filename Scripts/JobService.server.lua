@@ -7,6 +7,8 @@
 	  - Paying salary every 10 minutes of in-game time
 	  - Job change requests (30 minute cooldown, enforced on the server)
 	  - Applying job abilities (stats + tools) on spawn
+	  - One-per-server jobs (Mayor, Sheriff) via MaxPerServer in JobsConfig
+	  - Door purchases: unowned again and refunded 50% when the player leaves
 ]]
 
 local Players = game:GetService("Players")
@@ -19,6 +21,7 @@ local JobsConfig = require(ReplicatedStorage:WaitForChild("JobsConfig"))
 
 local DATASTORE_NAME = "PlayerData_v1"
 local AUTOSAVE_INTERVAL = 60
+local DOOR_REFUND_RATE = 0.5 -- share of a door's price refunded when the player leaves
 local store = DataStoreService:GetDataStore(DATASTORE_NAME)
 
 ---------------------------------------------------------------------
@@ -49,12 +52,40 @@ local function defaultData()
 		Job = JobsConfig.DEFAULT_JOB,
 		LastJobChange = 0, -- unix time of last change (0 = never, so first pick is free)
 		SalaryProgress = 0, -- seconds toward the next paycheck
-		OwnedDoors = {}, -- ids of doors this player has purchased
+		DoorPurchases = {}, -- [doorId] = price paid. Refunded 50% when the player leaves
 	}
 end
 
--- sessions[player] = { Data = {...}, Loaded = bool }
+-- sessions[player] = { Data = {...}, Loaded = bool, Leaving = bool }
 local sessions = {}
+
+-- How many players currently hold a job. Players who are leaving don't count,
+-- so their slot is free the moment they disconnect.
+local function countPlayersWithJob(jobId, exceptPlayer)
+	local count = 0
+	for other, session in pairs(sessions) do
+		if other ~= exceptPlayer and session.Loaded and not session.Leaving and session.Data.Job == jobId then
+			count += 1
+		end
+	end
+	return count
+end
+
+local function jobIsFull(job, exceptPlayer)
+	return job.MaxPerServer ~= nil and countPlayersWithJob(job.Id, exceptPlayer) >= job.MaxPerServer
+end
+
+-- Gives back DOOR_REFUND_RATE of the price of every door the player bought and
+-- clears them (doors become unowned). Safe to call more than once. Returns the refund.
+local function refundDoors(data)
+	local refund = 0
+	for _, price in pairs(data.DoorPurchases) do
+		refund += math.floor(price * DOOR_REFUND_RATE)
+	end
+	data.DoorPurchases = {}
+	data.Money += refund
+	return refund
+end
 
 ---------------------------------------------------------------------
 -- Data loading / saving
@@ -76,8 +107,9 @@ local function loadData(player)
 			if not JobsConfig.ById[data.Job] then
 				data.Job = JobsConfig.DEFAULT_JOB
 			end
-			if type(data.OwnedDoors) ~= "table" then
-				data.OwnedDoors = {}
+			data.OwnedDoors = nil -- old format from an earlier version, no longer used
+			if type(data.DoorPurchases) ~= "table" then
+				data.DoorPurchases = {}
 			end
 			return data
 		end
@@ -329,12 +361,21 @@ local function setDoorAttributes(player)
 	if not session or not session.Loaded then
 		return
 	end
-	for _, doorId in ipairs(session.Data.OwnedDoors) do
+	for doorId in pairs(session.Data.DoorPurchases) do
 		player:SetAttribute("Door_" .. doorId, true)
 	end
 end
 
-purchaseDoorFunction.OnInvoke = function(player, doorId, price)
+-- Removes the "Door_<id>" ownership attributes (doors become unowned for everyone else's prompts)
+local function clearDoorAttributes(player)
+	for name in pairs(player:GetAttributes()) do
+		if string.sub(name, 1, 5) == "Door_" then
+			player:SetAttribute(name, nil)
+		end
+	end
+end
+
+purchaseDoorFunction.OnInvoke = function(player, doorId, price, maxOwners)
 	local session = sessions[player]
 	if not session or not session.Loaded then
 		return false, "Your data is still loading."
@@ -344,15 +385,27 @@ purchaseDoorFunction.OnInvoke = function(player, doorId, price)
 	end
 
 	local data = session.Data
-	if table.find(data.OwnedDoors, doorId) then
+	if data.DoorPurchases[doorId] then
 		return false, "You already own this door."
+	end
+
+	-- Owner limit for this door (the door's NumAllowedOwners attribute)
+	maxOwners = type(maxOwners) == "number" and math.max(1, math.floor(maxOwners)) or 1
+	local ownerCount = 0
+	for _, otherSession in pairs(sessions) do
+		if otherSession.Loaded and not otherSession.Leaving and otherSession.Data.DoorPurchases[doorId] then
+			ownerCount += 1
+		end
+	end
+	if ownerCount >= maxOwners then
+		return false, "This door already has the maximum number of owners."
 	end
 	if data.Money < price then
 		return false, ("You need $%d to buy this door."):format(price)
 	end
 
 	data.Money -= price
-	table.insert(data.OwnedDoors, doorId)
+	data.DoorPurchases[doorId] = price
 	setDoorAttributes(player)
 	syncPlayer(player)
 	task.spawn(saveData, player) -- save right away so a purchase is never lost
@@ -374,6 +427,9 @@ requestJobChange.OnServerInvoke = function(player, jobId)
 	end
 	if session.Data.Job == jobId then
 		return false, "You already have that job."
+	end
+	if jobIsFull(job, player) then
+		return false, ("%s is already taken by another player."):format(job.Name)
 	end
 
 	local now = serverNow()
@@ -434,6 +490,20 @@ local function onPlayerAdded(player)
 	end
 
 	sessions[player].Data = data
+
+	-- Crash recovery: doors left over from a session that never ended cleanly get refunded now
+	local leftoverRefund = refundDoors(data)
+
+	-- One-per-server jobs: if another player already holds this job, demote to Unemployed.
+	-- (No yielding between this check and Loaded = true, so two joiners can't both win.)
+	local demotedFrom = nil
+	local savedJob = JobsConfig.ById[data.Job]
+	if jobIsFull(savedJob, player) then
+		demotedFrom = savedJob.Name
+		data.Job = JobsConfig.DEFAULT_JOB
+		data.LastJobChange = 0 -- demotion wasn't their choice, so no cooldown
+	end
+
 	sessions[player].Loaded = true
 	createLeaderstats(player)
 	syncPlayer(player)
@@ -445,9 +515,27 @@ local function onPlayerAdded(player)
 	if player.Character then
 		applyJob(player)
 	end
+
+	task.delay(3, function() -- give the client a moment to build its UI
+		if not player.Parent then
+			return
+		end
+		if demotedFrom then
+			notifyEvent:FireClient(player, ("Another player already has the %s job, so you are now Unemployed."):format(demotedFrom))
+		end
+		if leftoverRefund > 0 then
+			notifyEvent:FireClient(player, ("Your doors from your last session were refunded: $%d"):format(leftoverRefund))
+		end
+	end)
 end
 
 local function onPlayerRemoving(player)
+	local session = sessions[player]
+	if session and session.Loaded then
+		session.Leaving = true -- frees up their job slot immediately
+		refundDoors(session.Data) -- doors become unowned, player gets 50% back
+		clearDoorAttributes(player) -- door prompts update right away
+	end
 	saveData(player)
 	sessions[player] = nil
 end
@@ -471,6 +559,10 @@ end)
 -- Save everyone when the server shuts down
 game:BindToClose(function()
 	for _, player in ipairs(Players:GetPlayers()) do
+		local session = sessions[player]
+		if session and session.Loaded then
+			refundDoors(session.Data)
+		end
 		task.spawn(saveData, player)
 	end
 	task.wait(3)

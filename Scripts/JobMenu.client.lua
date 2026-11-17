@@ -205,6 +205,20 @@ end)
 ---------------------------------------------------------------------
 -- Refresh loop
 ---------------------------------------------------------------------
+-- True when a limited job (e.g. Mayor, Sheriff) is already held by someone in this server
+local function jobIsTaken(job)
+	if not job.MaxPerServer then
+		return false
+	end
+	local count = 0
+	for _, other in ipairs(Players:GetPlayers()) do
+		if other:GetAttribute("JobId") == job.Id then
+			count += 1
+		end
+	end
+	return count >= job.MaxPerServer
+end
+
 local function refresh()
 	local leaderstats = player:FindFirstChild("leaderstats")
 	if leaderstats and leaderstats:FindFirstChild("Money") then
@@ -224,6 +238,8 @@ local function refresh()
 	for jobId, button in pairs(rows) do
 		if jobId == currentJob then
 			button.BackgroundColor3 = Color3.fromRGB(40, 90, 55)
+		elseif jobIsTaken(JobsConfig.ById[jobId]) then
+			button.BackgroundColor3 = Color3.fromRGB(75, 38, 38) -- red tint: another player has this job
 		elseif remaining > 0 then
 			button.BackgroundColor3 = Color3.fromRGB(38, 38, 42)
 		else
